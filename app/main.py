@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
@@ -312,6 +312,48 @@ def list_attendance(
         .limit(page_size)
     )
     return {"items": [record_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[StrictInt] = Field(default=None, ge=100000000000, le=4102444800000)
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = from_millis(body.punched_at) if body.punched_at is not None else now_utc()
+
+    # the employee's most recent record whose punch_in is at or before ts (works across midnight;
+    # ABSENT/LEAVE records have no punch_in, so they never match)
+    rec = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}},
+        sort=[("punch_in", -1)],
+    )
+    if rec is None:
+        raise HTTPException(404, "no punch-in found")
+    if rec.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+
+    punch_in_ts = rec["punch_in"]
+    if ts <= punch_in_ts or ts - punch_in_ts > timedelta(hours=24):
+        raise HTTPException(422, "punched_at must be after punch_in and within 24 hours of it")
+
+    _, _, end_dt = shift_window(punch_in_ts, emp["shift_start"], emp["shift_end"])
+    hours = compute_work_hours(punch_in_ts, ts)
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": rec["_id"], "punch_out": None},      # only succeeds if still open: race-safe
+        {"$set": {
+            "punch_out": ts,
+            "work_hours": hours,
+            "overtime_minutes": compute_overtime(ts, end_dt),
+            "half_day": hours < 4.5,                  # compared on the rounded value (R5)
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:                               # someone else closed it first
+        raise HTTPException(409, "already punched out")
+    return record_out(updated)
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}

@@ -10,6 +10,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 from contextlib import asynccontextmanager
 
@@ -51,18 +52,65 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def from_millis(ms: int) -> datetime:
+    """Epoch milliseconds -> UTC datetime, cut down to whole seconds (R1)."""
+    return datetime.fromtimestamp(ms // 1000, tz=timezone.utc)
+
+
+def to_millis(dt: datetime) -> int:
+    """Datetime -> epoch milliseconds (the format the API returns)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt - EPOCH) // timedelta(milliseconds=1)
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def shift_window(punch_in: datetime, shift_start: str, shift_end: str):
+    """Return (attendance_date, shift_start_dt, shift_end_dt). The datetimes are IST."""
+    local = punch_in.astimezone(IST)
+    sh, sm = map(int, shift_start.split(":"))
+    eh, em = map(int, shift_end.split(":"))
+    overnight = (eh, em) <= (sh, sm)
+    day = local.date()
+    # overnight shift: a punch-in earlier than shift_end belongs to the previous day (R1)
+    if overnight and (local.hour, local.minute, local.second) < (eh, em, 0):
+        day = day - timedelta(days=1)
+    start_dt = datetime(day.year, day.month, day.day, sh, sm, tzinfo=IST)
+    end_day = day + timedelta(days=1) if overnight else day
+    end_dt = datetime(end_day.year, end_day.month, end_day.day, eh, em, tzinfo=IST)
+    return day.isoformat(), start_dt, end_dt
+
+
+def compute_late_minutes(punch_in: datetime, shift_start_dt: datetime) -> int:
+    seconds = int((punch_in - shift_start_dt).total_seconds())
+    return seconds // 60 if seconds > 600 else 0          # strictly more than 10:00 (R2)
+
+
+def compute_overtime(punch_out: datetime, shift_end_dt: datetime) -> int:
+    minutes = int((punch_out - shift_end_dt).total_seconds()) // 60
+    return minutes if minutes >= 30 else 0                # at least 30 minutes (R3)
+
+
+def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
+    seconds = int((punch_out - punch_in).total_seconds())
+    hours = Decimal(seconds) / Decimal(3600)
+    return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))   # half-up (R4)
     h, m = map(int, shift_start.split(":"))
     start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
     minutes = int((punch_in - start).total_seconds() / 60)
     return minutes if minutes > 10 else 0
 
 
-def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
+
+
     h, m = map(int, shift_end.split(":"))
     end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
     return max(0, int((punch_out - end).total_seconds() / 60))

@@ -11,20 +11,41 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+client = MongoClient(
+    os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+    tz_aware=True,                  # datetimes come back with a timezone (UTC), not naive
+    serverSelectionTimeoutMS=3000,  # fail fast if MongoDB is down
+)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+def create_indexes():
+    # one employee per emp_code
+    db.employees.create_index("emp_code", unique=True)
+    # one record per employee per day (this also stops the punch-in race)
+    db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
+    # for listing attendance sorted by date desc, then emp_code asc
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    create_indexes()   # runs once when the app starts; safe to run again
+    yield
+
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -71,6 +92,10 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    try:
+        client.admin.command("ping")
+    except Exception:
+        raise HTTPException(503, "database unavailable")
     return {"status": "ok"}
 
 

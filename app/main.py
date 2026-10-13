@@ -597,6 +597,54 @@ def department_summary(
             "on_duty_count": r["on_duty_count"],
         })
     return out
+# ---------- Late leaderboard ----------
+def late_leaderboard_pipeline(month, limit, department=None):
+    year, mon = int(month[:4]), int(month[5:])
+    first = f"{month}-01"
+    last = f"{month}-{calendar.monthrange(year, mon)[1]:02d}"
+
+    pipeline = [
+        # only late logs in the month; the (date, emp_code) index serves this
+        {"$match": {"date": {"$gte": first, "$lte": last},
+                    "late_minutes": {"$gt": 0}}},
+        {"$group": {"_id": "$emp_code",
+                    "total_late_minutes": {"$sum": "$late_minutes"},
+                    "late_count": {"$sum": 1}}},
+        {"$lookup": {"from": "employees", "localField": "_id",
+                     "foreignField": "emp_code", "as": "emp"}},
+        {"$unwind": "$emp"},  # logs whose employee does not exist are dropped
+    ]
+    if department:
+        pipeline.append({"$match": {"emp.department": department}})
+    pipeline += [
+        # standard competition ranking: ties share a rank (1, 2, 2, 4)
+        {"$setWindowFields": {
+            "sortBy": {"total_late_minutes": -1},
+            "output": {"rank": {"$rank": {}}},
+        }},
+        {"$match": {"rank": {"$lte": limit}}},  # keeps everyone tied at the cutoff
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {"$project": {
+            "_id": 0,
+            "rank": 1,
+            "emp_code": "$_id",
+            "name": "$emp.name",
+            "department": "$emp.department",
+            "total_late_minutes": 1,
+            "late_count": 1,
+        }},
+    ]
+    return pipeline
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(..., pattern=MONTH_PATTERN),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = Query(None, min_length=1, max_length=50),
+):
+    return list(db.attendance_logs.aggregate(
+        late_leaderboard_pipeline(month, limit, department)))
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}

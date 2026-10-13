@@ -511,6 +511,92 @@ def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_PATTER
         "total_overtime_minutes": int(stats.get("total_overtime_minutes", 0)),
         "attendance_pct": pct,
     }
+# ---------- Department monthly summary ----------
+DS_PRESENCE = ["PRESENT", "WFH", "ON_DUTY"]
+
+
+def department_summary_pipeline(month, department=None):
+    year, mon = int(month[:4]), int(month[5:])
+    first = f"{month}-01"
+    last = f"{month}-{calendar.monthrange(year, mon)[1]:02d}"
+
+    emp_match = {"joined_on": {"$lte": last}}  # R9: joined on or before month end
+    if department:
+        emp_match["department"] = department
+
+    def total(expr):
+        # add up one expression over every attendance log of the employee
+        return {"$sum": {"$map": {"input": "$logs", "as": "l", "in": expr}}}
+
+    is_presence = {"$in": ["$$l.status", DS_PRESENCE]}
+    is_weekday = {"$lte": [
+        {"$isoDayOfWeek": {"$dateFromString": {"dateString": "$$l.date"}}}, 5]}
+    weight = {"$cond": [
+        {"$eq": [{"$ifNull": ["$$l.half_day", False]}, True]}, 0.5, 1]}
+    has_hours = {"$and": [
+        is_presence,
+        {"$ne": [{"$ifNull": ["$$l.work_hours", None]}, None]}]}
+    late_min = {"$ifNull": ["$$l.late_minutes", 0]}
+
+    return [
+        {"$match": emp_match},
+        {"$lookup": {
+            "from": "attendance_logs",
+            "let": {"c": "$emp_code"},
+            "pipeline": [{"$match": {"$expr": {"$and": [
+                {"$eq": ["$emp_code", "$$c"]},
+                {"$gte": ["$date", first]},
+                {"$lte": ["$date", last]},
+            ]}}}],
+            "as": "logs",
+        }},
+        {"$group": {
+            "_id": "$department",
+            "headcount": {"$sum": 1},
+            "present_days": {"$sum": total(
+                {"$cond": [{"$and": [is_presence, is_weekday]}, weight, 0]})},
+            "hundredths": {"$sum": total(
+                {"$cond": [has_hours,
+                           {"$round": [{"$multiply": ["$$l.work_hours", 100]}, 0]},
+                           0]})},
+            "hours_count": {"$sum": total({"$cond": [has_hours, 1, 0]})},
+            "late_count": {"$sum": total(
+                {"$cond": [{"$gt": [late_min, 0]}, 1, 0]})},
+            "total_late_minutes": {"$sum": total(late_min)},
+            "leave_count": {"$sum": total(
+                {"$cond": [{"$eq": ["$$l.status", "LEAVE"]}, 1, 0]})},
+            "on_duty_count": {"$sum": total(
+                {"$cond": [{"$eq": ["$$l.status", "ON_DUTY"]}, 1, 0]})},
+        }},
+        {"$sort": {"_id": 1}},
+    ]
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(
+    month: str = Query(..., pattern=MONTH_PATTERN),
+    department: Optional[str] = Query(None, min_length=1, max_length=50),
+):
+    rows = list(db.employees.aggregate(department_summary_pipeline(month, department)))
+    out = []
+    for r in rows:
+        n = r["hours_count"]
+        if n:
+            avg = (Decimal(int(r["hundredths"])) / Decimal(n) / Decimal(100)).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP)
+        else:
+            avg = Decimal("0.00")
+        out.append({
+            "department": r["_id"],
+            "headcount": r["headcount"],
+            "present_days": float(r["present_days"]),
+            "avg_work_hours": float(avg),
+            "late_count": r["late_count"],
+            "total_late_minutes": r["total_late_minutes"],
+            "leave_count": r["leave_count"],
+            "on_duty_count": r["on_duty_count"],
+        })
+    return out
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}

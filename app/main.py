@@ -9,8 +9,9 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import calendar
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date as Date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Literal, Optional
 from contextlib import asynccontextmanager
@@ -435,6 +436,81 @@ def regularize(emp_code: str, date: str, body: RegularizeIn):
     if updated is None:
         raise HTTPException(409, "record was changed by someone else; please retry")
     return record_out(updated)
+# --------------------------------------------------------------------------- #
+# Analytics
+# --------------------------------------------------------------------------- #
+MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+
+
+def round_half_up(value, places: int = 2) -> float:
+    """Round half-up (R8). Python's round() is not half-up."""
+    q = Decimal(1).scaleb(-places)
+    return float(Decimal(str(value)).quantize(q, rounding=ROUND_HALF_UP))
+
+
+def month_bounds(month: str):
+    """First and last day of 'YYYY-MM', as date objects."""
+    y, m = int(month[:4]), int(month[5:7])
+    return Date(y, m, 1), Date(y, m, calendar.monthrange(y, m)[1])
+
+
+def count_weekdays(start: Date, end: Date) -> int:
+    """Mon-Fri days from start to end, both included (R7)."""
+    if end < start:
+        return 0
+    return sum(1 for i in range((end - start).days + 1) if (start + timedelta(days=i)).weekday() < 5)
+
+
+# Pieces of aggregation expressions, reused by several analytics endpoints.
+# They read the STORED values; nothing is recomputed from punch times.
+LATE = {"$ifNull": ["$late_minutes", 0]}
+OVERTIME = {"$ifNull": ["$overtime_minutes", 0]}
+IS_PRESENT = {"$in": ["$status", list(PRESENCE)]}                      # R6
+IS_WEEKDAY = {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}}}, 5]}
+PRESENT_WEIGHT = {"$cond": [                                           # R5, R7
+    {"$and": [IS_PRESENT, IS_WEEKDAY]},
+    {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]},
+    0,
+]}
+
+
+def employee_monthly_pipeline(emp_code: str, month: str) -> list:
+    first, last = month_bounds(month)
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first.isoformat(), "$lte": last.isoformat()}}},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": PRESENT_WEIGHT},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [LATE, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": LATE},
+            "total_overtime_minutes": {"$sum": OVERTIME},
+        }},
+    ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_PATTERN)):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    first, last = month_bounds(month)
+    start = max(first, Date.fromisoformat(emp["joined_on"]))      # count from joined_on (R7)
+    working_days = count_weekdays(start, last)
+    stats = next(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code, month)), {})
+    present = stats.get("present_days", 0)
+    pct = round_half_up(Decimal(str(present)) / working_days * 100) if working_days else None
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": float(present),
+        "leave_days": int(stats.get("leave_days", 0)),
+        "late_count": int(stats.get("late_count", 0)),
+        "total_late_minutes": int(stats.get("total_late_minutes", 0)),
+        "total_overtime_minutes": int(stats.get("total_overtime_minutes", 0)),
+        "attendance_pct": pct,
+    }
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}

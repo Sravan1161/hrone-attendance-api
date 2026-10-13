@@ -312,6 +312,7 @@ def list_attendance(
         .limit(page_size)
     )
     return {"items": [record_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
+
 class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: Optional[StrictInt] = Field(default=None, ge=100000000000, le=4102444800000)

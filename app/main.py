@@ -645,6 +645,104 @@ def late_leaderboard(
 ):
     return list(db.attendance_logs.aggregate(
         late_leaderboard_pipeline(month, limit, department)))
+# ---------- Department daily trend ----------
+DAY_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
+
+
+def department_trend_pipeline(codes, joined, date_from, date_to):
+    lo = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    hi = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+    is_presence = {"$in": ["$status", DS_PRESENCE]}
+    weight = {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]}
+    win = {"documents": [-6, 0]}  # current row + up to 6 previous rows
+
+    return [
+        {"$match": {"date": {"$gte": date_from, "$lte": date_to},
+                    "emp_code": {"$in": codes}}},
+        {"$group": {
+            "_id": "$date",
+            "present_count": {"$sum": {"$cond": [is_presence, weight, 0]}},
+            "late_count": {"$sum": {"$cond": [
+                {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+        }},
+        {"$addFields": {"_d": {"$dateFromString": {"dateString": "$_id"}}}},
+        # one row for every calendar day in the range, even with no logs
+        {"$densify": {"field": "_d",
+                      "range": {"step": 1, "unit": "day", "bounds": [lo, hi]}}},
+        {"$addFields": {
+            "day": {"$dateToString": {"date": "$_d", "format": "%Y-%m-%d"}},
+            "dow": {"$isoDayOfWeek": "$_d"},
+            "present_count": {"$ifNull": ["$present_count", 0]},
+            "late_count": {"$ifNull": ["$late_count", 0]},
+        }},
+        {"$addFields": {
+            "is_working_day": {"$lte": ["$dow", 5]},
+            "headcount": {"$size": {"$filter": {
+                "input": {"$literal": joined}, "as": "j",
+                "cond": {"$lte": ["$$j", "$day"]}}}},
+        }},
+        # rate in units of 0.0001, half-up, using integer maths:
+        # floor((40000*present + 2*headcount) / (4*headcount))
+        {"$addFields": {"rate_u": {"$cond": [
+            {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+            {"$floor": {"$divide": [
+                {"$add": [{"$multiply": ["$present_count", 40000]},
+                          {"$multiply": ["$headcount", 2]}]},
+                {"$multiply": ["$headcount", 4]}]}},
+            None]}}},
+        {"$addFields": {"has_rate": {"$cond": [{"$eq": ["$rate_u", None]}, 0, 1]}}},
+        {"$setWindowFields": {
+            "sortBy": {"_d": 1},
+            "output": {
+                "ru_sum": {"$sum": "$rate_u", "window": win},
+                "ru_cnt": {"$sum": "$has_rate", "window": win},
+            },
+        }},
+        {"$sort": {"_d": 1}},
+        {"$project": {
+            "_id": 0,
+            "date": "$day",
+            "is_working_day": 1,
+            "headcount": 1,
+            "present_count": 1,
+            "late_count": 1,
+            "attendance_rate": {"$cond": [
+                {"$eq": ["$rate_u", None]}, None, {"$divide": ["$rate_u", 10000]}]},
+            # mean of the rates, half-up to 4 decimals, again with integer maths
+            "moving_avg_7d": {"$cond": [
+                {"$eq": ["$ru_cnt", 0]}, None,
+                {"$divide": [{"$floor": {"$divide": [
+                    {"$add": [{"$multiply": ["$ru_sum", 2]}, "$ru_cnt"]},
+                    {"$multiply": ["$ru_cnt", 2]}]}}, 10000]}]},
+        }},
+    ]
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    date_from: str = Query(..., alias="from", pattern=DAY_PATTERN),
+    date_to: str = Query(..., alias="to", pattern=DAY_PATTERN),
+):
+    try:
+        d1 = Date.fromisoformat(date_from)
+        d2 = Date.fromisoformat(date_to)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="invalid date")
+    if d2 < d1:
+        raise HTTPException(status_code=422, detail="to must not be before from")
+    if (d2 - d1).days + 1 > 92:
+        raise HTTPException(status_code=422, detail="range must be at most 92 days")
+
+    emps = list(db.employees.find({"department": department},
+                                  {"_id": 0, "emp_code": 1, "joined_on": 1}))
+    if not emps:
+        raise HTTPException(status_code=404, detail="department not found")
+
+    codes = [e["emp_code"] for e in emps]
+    joined = [e["joined_on"] for e in emps]
+    return list(db.attendance_logs.aggregate(
+        department_trend_pipeline(codes, joined, date_from, date_to)))
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}

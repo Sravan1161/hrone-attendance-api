@@ -1,5 +1,6 @@
 
 # REVIEW.md
+Line numbers refer to the original starter file.
 
 | # | Where (function / line) | What is wrong | How you'd notice it | How I fixed it |
 |---|---|---|---|---|

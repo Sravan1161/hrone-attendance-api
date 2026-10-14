@@ -597,18 +597,18 @@ def department_summary(
             avg = (Decimal(int(r["hundredths"])) / Decimal(n) / Decimal(100)).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP)
         else:
-            avg = Decimal("0.00")
+                        avg = None
         out.append({
             "department": r["_id"],
             "headcount": r["headcount"],
             "present_days": float(r["present_days"]),
-            "avg_work_hours": float(avg),
+            "avg_work_hours": float(avg) if avg is not None else None,
             "late_count": r["late_count"],
             "total_late_minutes": r["total_late_minutes"],
             "leave_count": r["leave_count"],
             "on_duty_count": r["on_duty_count"],
         })
-    return out
+    return {"month": month, "items": out}
 
 
 # ---------- Late leaderboard ----------
@@ -657,8 +657,9 @@ def late_leaderboard(
     limit: int = Query(10, ge=1, le=50),
     department: Optional[str] = Query(None, min_length=1, max_length=50),
 ):
-    return list(db.attendance_logs.aggregate(
+    items = list(db.attendance_logs.aggregate(
         late_leaderboard_pipeline(month, limit, department)))
+    return {"month": month, "items": items}
 
 
 # ---------- Department daily trend ----------
@@ -758,8 +759,9 @@ def department_trend(
     date_from: str = Query(..., alias="from", pattern=DAY_PATTERN),
     date_to: str = Query(..., alias="to", pattern=DAY_PATTERN),
 ):
-    return list(db.attendance_logs.aggregate(
+    items = list(db.attendance_logs.aggregate(
         build_trend_pipeline(department, date_from, date_to)))
+    return {"department": department, "items": items}
 
 
 # --------------------------------------------------------------------------- #

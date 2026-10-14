@@ -4,3 +4,7 @@ __pycache__/
 PROBLEM_STATEMENT.docx
 scratch_test.py
 scratch_race.py
+sample_data/
+sample_seed.py
+openapi.yaml
+DATA_MODEL.md
